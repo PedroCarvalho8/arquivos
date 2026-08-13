@@ -1,0 +1,277 @@
+{
+  "Comment": "Maquina agnostica de processamento em lote. Le um prefixo S3 (LOAD_AND_FLATTEN), processa linha a linha via executora-lote-{tipo_lote}, e delega o pos-processamento a um compute escolhido por input.",
+  "StartAt": "ValidarExecutora",
+  "States": {
+
+    "ValidarExecutora": {
+      "Comment": "Falha rapido (~200ms) se tipo_lote estiver errado, em vez de descobrir dentro do Map.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:lambda:getFunction",
+      "Parameters": {
+        "FunctionName.$": "States.Format('executora-lote-{}', $.tipo_lote)"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.erro",
+          "Next": "FalhaEntrada"
+        }
+      ],
+      "Next": "ProcessarLote"
+    },
+
+    "ProcessarLote": {
+      "Type": "Map",
+      "Label": "ProcessarLote",
+      "MaxConcurrency": 500,
+      "ToleratedFailurePercentage": 5,
+
+      "ItemReader": {
+        "Comment": "listObjectsV2 + LOAD_AND_FLATTEN: descobre os N arquivos sob o prefixo e itera sobre LINHAS. InputType e estatico - gerado via templatefile no Terraform.",
+        "Resource": "arn:aws:states:::s3:listObjectsV2",
+        "ReaderConfig": {
+          "InputType": "${input_type}",
+          "Transformation": "LOAD_AND_FLATTEN"
+        },
+        "Parameters": {
+          "Bucket.$": "$.bucket_entrada",
+          "Prefix.$": "$.prefixo_entrada"
+        }
+      },
+
+      "ItemSelector": {
+        "item.$": "$$.Map.Item.Value",
+        "origem.$": "$$.Map.Item.Source",
+        "tipo_lote.$": "$.tipo_lote",
+        "execution_id.$": "$$.Execution.Name"
+      },
+
+      "ItemBatcher": {
+        "MaxItemsPerBatch": 100
+      },
+
+      "ItemProcessor": {
+        "ProcessorConfig": { "Mode": "DISTRIBUTED", "ExecutionType": "STANDARD" },
+        "StartAt": "InvocarExecutora",
+        "States": {
+          "InvocarExecutora": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName.$": "States.Format('executora-lote-{}:live', $.BatchInput.tipo_lote)",
+              "Payload.$": "$"
+            },
+            "OutputPath": "$.Payload",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 6,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "End": true
+          }
+        }
+      },
+
+      "ResultWriter": {
+        "Comment": "Payload da execucao fica pequeno: retorna a URI do manifesto, nao os itens.",
+        "Resource": "arn:aws:states:::s3:putObject",
+        "Parameters": {
+          "Bucket": "${bucket_resultados}",
+          "Prefix.$": "States.Format('{}/{}', $.tipo_lote, $$.Execution.Name)"
+        }
+      },
+
+      "ResultPath": "$.resultado_map",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.erro",
+          "Next": "AlertarFalha"
+        }
+      ],
+      "Next": "ObterMapRun"
+    },
+
+    "ObterMapRun": {
+      "Comment": "itemCounts nativo do Map Run substitui o antigo passo de preparacao de metadados.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sfn:listMapRuns",
+      "Parameters": { "ExecutionArn.$": "$$.Execution.Id" },
+      "ResultSelector": { "arn.$": "$.MapRuns[0].MapRunArn" },
+      "ResultPath": "$.map_run",
+      "Next": "DescreverMapRun"
+    },
+
+    "DescreverMapRun": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:sfn:describeMapRun",
+      "Parameters": { "MapRunArn.$": "$.map_run.arn" },
+      "ResultSelector": {
+        "total.$": "$.ItemCounts.Total",
+        "sucesso.$": "$.ItemCounts.Succeeded",
+        "falha.$": "$.ItemCounts.Failed",
+        "abortado.$": "$.ItemCounts.Aborted"
+      },
+      "ResultPath": "$.contagens",
+      "Next": "AvaliarCompletude"
+    },
+
+    "AvaliarCompletude": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Comment": "Falha parcial: o Map concluiu dentro da tolerancia, mas ha itens em FAILED_*.json.",
+          "Variable": "$.contagens.falha",
+          "NumericGreaterThan": 0,
+          "Next": "AlertarFalhaParcial"
+        },
+        {
+          "Comment": "Divergencia entre o esperado pelo produtor e o lido pelo Map. Campo opcional.",
+          "And": [
+            { "Variable": "$.total_esperado", "IsPresent": true },
+            { "Not": { "Variable": "$.contagens.total", "NumericEqualsPath": "$.total_esperado" } }
+          ],
+          "Next": "AlertarDivergencia"
+        }
+      ],
+      "Default": "EscolherTratador"
+    },
+
+    "EscolherTratador": {
+      "Comment": "Mesma convencao de nome da executora, aplicada ao pos-processamento. Nenhum codigo dinamico: o compute e escolhido entre opcoes fixas.",
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.compute_saida", "StringEquals": "athena", "Next": "TratadorAthena" },
+        { "Variable": "$.compute_saida", "StringEquals": "lambda", "Next": "TratadorLambda" },
+        { "Variable": "$.compute_saida", "StringEquals": "glue",   "Next": "TratadorGlue" }
+      ],
+      "Default": "Sucesso"
+    },
+
+    "TratadorAthena": {
+      "Comment": "SQL vive num prepared statement por dominio (aws_athena_prepared_statement). O input so fornece o parametro - nada de SQL vindo do payload.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Parameters": {
+        "QueryString.$": "States.Format('EXECUTE tratador_lote_{} USING ''{}''', $.tipo_lote, $$.Execution.Name)",
+        "WorkGroup": "${athena_workgroup}"
+      },
+      "ResultPath": "$.tratamento",
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.erro", "Next": "AlertarFalha" }
+      ],
+      "Next": "Sucesso"
+    },
+
+    "TratadorLambda": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName.$": "States.Format('tratador-lote-{}:live', $.tipo_lote)",
+        "Payload": {
+          "manifesto_saida.$": "$.resultado_map.ResultWriterDetails.Key",
+          "bucket_resultados": "${bucket_resultados}",
+          "execution_id.$": "$$.Execution.Name",
+          "contagens.$": "$.contagens"
+        }
+      },
+      "ResultPath": "$.tratamento",
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.erro", "Next": "AlertarFalha" }
+      ],
+      "Next": "Sucesso"
+    },
+
+    "TratadorGlue": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::glue:startJobRun.sync",
+      "Parameters": {
+        "JobName.$": "States.Format('tratador-lote-{}', $.tipo_lote)",
+        "Arguments": {
+          "--manifesto_saida.$": "$.resultado_map.ResultWriterDetails.Key",
+          "--bucket_resultados": "${bucket_resultados}",
+          "--execution_id.$": "$$.Execution.Name"
+        }
+      },
+      "Retry": [
+        {
+          "Comment": "MaxConcurrentRuns default e 1: dois lotes do mesmo tipo em paralelo colidem.",
+          "ErrorEquals": ["Glue.ConcurrentRunsExceededException"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 10,
+          "BackoffRate": 1.5
+        }
+      ],
+      "ResultPath": "$.tratamento",
+      "Catch": [
+        { "ErrorEquals": ["States.ALL"], "ResultPath": "$.erro", "Next": "AlertarFalha" }
+      ],
+      "Next": "Sucesso"
+    },
+
+    "AlertarFalhaParcial": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topico_alertas}",
+        "Subject.$": "States.Format('Lote {} com falhas parciais', $.tipo_lote)",
+        "Message": {
+          "execution_id.$": "$$.Execution.Name",
+          "contagens.$": "$.contagens",
+          "manifesto.$": "$.resultado_map.ResultWriterDetails.Key"
+        }
+      },
+      "ResultPath": null,
+      "Comment": "Alerta mas segue: a reconciliacao ainda deve rodar para os itens que passaram.",
+      "Next": "EscolherTratador"
+    },
+
+    "AlertarDivergencia": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topico_alertas}",
+        "Subject.$": "States.Format('Lote {}: divergencia de contagem', $.tipo_lote)",
+        "Message": {
+          "esperado.$": "$.total_esperado",
+          "lido.$": "$.contagens.total",
+          "execution_id.$": "$$.Execution.Name"
+        }
+      },
+      "ResultPath": null,
+      "Next": "FalhaEntrada"
+    },
+
+    "AlertarFalha": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${topico_alertas}",
+        "Subject.$": "States.Format('Lote {} falhou', $.tipo_lote)",
+        "Message.$": "$.erro"
+      },
+      "ResultPath": null,
+      "Next": "Falha"
+    },
+
+    "FalhaEntrada": {
+      "Type": "Fail",
+      "Error": "EntradaInvalida",
+      "Cause": "tipo_lote inexistente ou contagem divergente do esperado"
+    },
+
+    "Falha": { "Type": "Fail", "Error": "LoteFalhou" },
+
+    "Sucesso": { "Type": "Succeed" }
+  }
+}
