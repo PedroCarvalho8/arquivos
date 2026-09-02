@@ -1,0 +1,460 @@
+{
+  "Comment": "Ingestao diaria DynamoDB -> Iceberg. Descobre o lote no Glue Data Catalog, exporta cada tabela em FULL_EXPORT e projeta o resultado no schema declarado do destino via um unico Glue job generico.",
+  "QueryLanguage": "JSONata",
+  "StartAt": "DescobrirTabelas",
+  "TimeoutSeconds": 86400,
+  "States": {
+    "DescobrirTabelas": {
+      "Comment": "Sem paginacao: 9 tabelas cabem folgadamente numa resposta do getTables. A configuracao vive nos Parameters da tabela Glue - por isso o filtro acontece aqui e nao num arquivo de inventario.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getTables",
+      "Arguments": {
+        "DatabaseName": "database-placeholder",
+        "Expression": "prefixo-placeholder*"
+      },
+      "Output": {
+        "lote": "{% [$states.result.TableList[Parameters.`ingestao.habilitado` = 'true'].($origem := $substringAfter(Name, 'prefixo-placeholder'); {'tabela_origem': $origem, 'arn_origem': 'arn:aws:dynamodb:regiao-placeholder:conta-placeholder:table/' & $origem, 'tabela_destino': 'catalogo-placeholder.' & DatabaseName & '.' & Name, 'modo': Parameters.`ingestao.modo` ? Parameters.`ingestao.modo` : 'FULL'})] %}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ThrottlingException",
+            "Glue.InternalServiceException",
+            "Glue.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FalhaNaDescoberta"
+        }
+      ],
+      "Next": "AvaliarLote"
+    },
+    "AvaliarLote": {
+      "Comment": "Distributed Map com Items vazio falha; e lote vazio aqui significa 'nenhuma tabela habilitada', que e um estado legitimo.",
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $count($states.input.lote) = 0 %}",
+          "Next": "NadaAFazer"
+        }
+      ],
+      "Default": "IngerirTabelas"
+    },
+    "IngerirTabelas": {
+      "Comment": "Items inline: 9 objetos pequenos ficam muito abaixo do teto de 256 KB do payload. MaxConcurrency 4 respeita a cota de exports concorrentes por conta com folga para retry.",
+      "Type": "Map",
+      "Label": "Ingestao",
+      "Items": "{% $states.input.lote %}",
+      "MaxConcurrency": 4,
+      "ToleratedFailureCount": 1,
+      "ItemSelector": {
+        "tabela": "{% $states.context.Map.Item.Value %}",
+        "execution_id": "{% $states.context.Execution.Name %}",
+        "instante_corte": "{% $states.context.Execution.StartTime %}",
+        "bucket_export": "bucket-export-placeholder"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "DISTRIBUTED",
+          "ExecutionType": "STANDARD"
+        },
+        "StartAt": "PrepararItem",
+        "States": {
+          "PrepararItem": {
+            "Comment": "Todas as variaveis nascem aqui. Referenciar variavel nao atribuida e erro de execucao, e o registro de falha pode ser alcancado antes de qualquer Task rodar. O ItemProcessor distribuido roda como execucao filha: nem o nome da execucao pai nem variaveis do pai chegam ate aqui, so o item.",
+            "Type": "Pass",
+            "Assign": {
+              "tabela": "{% $states.input.tabela %}",
+              "execucao": "{% $states.input.execution_id %}",
+              "corte": "{% $states.input.instante_corte %}",
+              "bucketExport": "{% $states.input.bucket_export %}",
+              "inicio": "{% $millis() %}",
+              "chaveParticao": "",
+              "chaveOrdenacao": "",
+              "arnExport": "",
+              "manifesto": "",
+              "situacao": "",
+              "erro": "",
+              "bytes": 0,
+              "itens": 0,
+              "workers": 0
+            },
+            "Next": "DescreverOrigem"
+          },
+          "DescreverOrigem": {
+            "Comment": "O KeySchema so existe na origem: o schema Iceberg nao distingue chave de atributo comum, e o job precisa saber quais colunas recebem sentinela em vez de NULL.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:describeTable",
+            "Arguments": {
+              "TableName": "{% $tabela.tabela_origem %}"
+            },
+            "Assign": {
+              "chaveParticao": "{% $states.result.Table.KeySchema[KeyType = 'HASH'].AttributeName %}",
+              "chaveOrdenacao": "{% ($r := $states.result.Table.KeySchema[KeyType = 'RANGE'].AttributeName; $r ? $r : '') %}"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "DynamoDb.InternalServerErrorException",
+                  "DynamoDb.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 4,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CapturarErro"
+              }
+            ],
+            "Next": "EscolherModo"
+          },
+          "EscolherModo": {
+            "Comment": "Ponto de extensao para o modo incremental. Hoje so FULL existe: qualquer outro valor falha em vez de cair silenciosamente no caminho errado.",
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Condition": "{% $tabela.modo = 'FULL' %}",
+                "Next": "ExportarTabela"
+              }
+            ],
+            "Default": "ModoNaoSuportado"
+          },
+          "ExportarTabela": {
+            "Comment": "ClientToken aceita qualquer texto sem '$' (pattern ^[^\\$]+$), entao nome da tabela + instante do corte cabe e um retry do Step Functions reusa o export em vez de pagar por outro. A janela de idempotencia e de 8h, bem menor que o intervalo diario, logo nao ha colisao entre dias.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:exportTableToPointInTime",
+            "Arguments": {
+              "TableArn": "{% $tabela.arn_origem %}",
+              "S3Bucket": "{% $bucketExport %}",
+              "S3Prefix": "{% $tabela.tabela_origem & '/' & $execucao %}",
+              "ExportFormat": "DYNAMODB_JSON",
+              "ExportType": "FULL_EXPORT",
+              "ExportTime": "{% $corte %}",
+              "ClientToken": "{% $tabela.tabela_origem & '-' & $corte %}"
+            },
+            "Assign": {
+              "arnExport": "{% $states.result.ExportDescription.ExportArn %}"
+            },
+            "Retry": [
+              {
+                "Comment": "LimitExceededException aqui e a cota de operacoes de tabela concorrentes por conta, nao throttle de leitura: o backoff precisa ser da ordem de minutos.",
+                "ErrorEquals": [
+                  "DynamoDb.LimitExceededException"
+                ],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 8,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 900,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": [
+                  "DynamoDb.InternalServerErrorException",
+                  "DynamoDb.SdkClientException"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 4,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CapturarErro"
+              }
+            ],
+            "Next": "AguardarExport"
+          },
+          "AguardarExport": {
+            "Type": "Wait",
+            "Seconds": 60,
+            "Next": "DescreverExport"
+          },
+          "DescreverExport": {
+            "Comment": "BilledSizeBytes e ItemCount so aparecem quando o export termina; ate la as guardas mantem os defaults.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:dynamodb:describeExport",
+            "Arguments": {
+              "ExportArn": "{% $arnExport %}"
+            },
+            "Assign": {
+              "situacao": "{% $states.result.ExportDescription.ExportStatus %}",
+              "manifesto": "{% ($m := $states.result.ExportDescription.ExportManifest; $m ? $m : '') %}",
+              "bytes": "{% ($b := $states.result.ExportDescription.BilledSizeBytes; $b ? $b : 0) %}",
+              "itens": "{% ($i := $states.result.ExportDescription.ItemCount; $i ? $i : 0) %}"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "DynamoDb.InternalServerErrorException",
+                  "DynamoDb.SdkClientException"
+                ],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 4,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CapturarErro"
+              }
+            ],
+            "Next": "AvaliarExport"
+          },
+          "AvaliarExport": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Condition": "{% $situacao = 'COMPLETED' %}",
+                "Next": "DimensionarWorkers"
+              },
+              {
+                "Condition": "{% $situacao = 'FAILED' %}",
+                "Next": "ExportFalhou"
+              }
+            ],
+            "Default": "AguardarExport"
+          },
+          "DimensionarWorkers": {
+            "Comment": "BilledSizeBytes e o tamanho descomprimido da tabela e o export vai para o S3 em gzip, entao a estimativa e conservadora de proposito. O teto de 32 existe porque gzip nao e splittable: acima do numero de arquivos do manifesto, worker a mais so custa.",
+            "Type": "Pass",
+            "Assign": {
+              "workers": "{% ($gb := $bytes / 1073741824; $gb < 1 ? 2 : $gb < 10 ? 4 : $gb < 50 ? 8 : $gb < 200 ? 16 : 32) %}"
+            },
+            "Next": "ProcessarNoGlue"
+          },
+          "ProcessarNoGlue": {
+            "Comment": "O Arguments externo e o payload da integracao; o Arguments interno e o campo homonimo do StartJobRun, com os parametros do job. --chave_ordenacao some do objeto quando a tabela nao tem sort key, porque chave com valor indefinido nao e emitida.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Arguments": {
+              "JobName": "job-ingestao-placeholder",
+              "WorkerType": "G.1X",
+              "NumberOfWorkers": "{% $workers %}",
+              "Arguments": "{% $merge([{'--tabela_origem': $tabela.tabela_origem, '--tabela_destino': $tabela.tabela_destino, '--bucket_export': $bucketExport, '--manifesto': $manifesto, '--execution_id': $execucao, '--chave_particao': $chaveParticao}, $chaveOrdenacao != '' ? {'--chave_ordenacao': $chaveOrdenacao} : {}]) %}"
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Glue.ConcurrentRunsExceededException"
+                ],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 10,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 900,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "CapturarErro"
+              }
+            ],
+            "TimeoutSeconds": 21600,
+            "Next": "RegistrarSucesso"
+          },
+          "CapturarErro": {
+            "Comment": "Converge os dois caminhos de falha - erro de Task e export FAILED - num unico registro, sem duplicar o putItem.",
+            "Type": "Pass",
+            "Assign": {
+              "erro": "{% $string($states.errorOutput) %}"
+            },
+            "Next": "RegistrarFalha"
+          },
+          "ExportFalhou": {
+            "Type": "Pass",
+            "Assign": {
+              "erro": "{% 'export terminou em ' & $situacao %}"
+            },
+            "Next": "RegistrarFalha"
+          },
+          "RegistrarSucesso": {
+            "Comment": "Serie historica por tabela: e o que vai decidir depois se alguma delas justifica migrar para incremental. A integracao otimizada usa o prefixo de erro DynamoDB, com B maiusculo; a integracao aws-sdk usa DynamoDb.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem",
+            "Arguments": {
+              "TableName": "tabela-observabilidade-placeholder",
+              "Item": {
+                "pk": {
+                  "S": "{% 'TABELA#' & $tabela.tabela_origem %}"
+                },
+                "sk": {
+                  "S": "{% $corte %}"
+                },
+                "situacao": {
+                  "S": "CONCLUIDO"
+                },
+                "modo": {
+                  "S": "{% $tabela.modo %}"
+                },
+                "destino": {
+                  "S": "{% $tabela.tabela_destino %}"
+                },
+                "execution_id": {
+                  "S": "{% $execucao %}"
+                },
+                "manifesto": {
+                  "S": "{% $manifesto %}"
+                },
+                "bytes_faturados": {
+                  "N": "{% $string($bytes) %}"
+                },
+                "itens": {
+                  "N": "{% $string($itens) %}"
+                },
+                "workers": {
+                  "N": "{% $string($workers) %}"
+                },
+                "duracao_s": {
+                  "N": "{% $string($round(($millis() - $inicio) / 1000)) %}"
+                }
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "DynamoDB.ThrottlingException",
+                  "DynamoDB.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 5,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Next": "Concluido"
+          },
+          "RegistrarFalha": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem",
+            "Arguments": {
+              "TableName": "tabela-observabilidade-placeholder",
+              "Item": {
+                "pk": {
+                  "S": "{% 'TABELA#' & $tabela.tabela_origem %}"
+                },
+                "sk": {
+                  "S": "{% $corte %}"
+                },
+                "situacao": {
+                  "S": "FALHOU"
+                },
+                "modo": {
+                  "S": "{% $tabela.modo %}"
+                },
+                "destino": {
+                  "S": "{% $tabela.tabela_destino %}"
+                },
+                "execution_id": {
+                  "S": "{% $execucao %}"
+                },
+                "manifesto": {
+                  "S": "{% $manifesto %}"
+                },
+                "bytes_faturados": {
+                  "N": "{% $string($bytes) %}"
+                },
+                "duracao_s": {
+                  "N": "{% $string($round(($millis() - $inicio) / 1000)) %}"
+                },
+                "erro": {
+                  "S": "{% $erro %}"
+                }
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "DynamoDB.ThrottlingException",
+                  "DynamoDB.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 5,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Falha"
+              }
+            ],
+            "Next": "Falha"
+          },
+          "ModoNaoSuportado": {
+            "Type": "Fail",
+            "Error": "ModoNaoSuportado",
+            "Cause": "Apenas FULL esta implementado; ajuste ingestao.modo nos Parameters da tabela Glue"
+          },
+          "Falha": {
+            "Type": "Fail",
+            "Error": "IngestaoFalhou"
+          },
+          "Concluido": {
+            "Type": "Succeed"
+          }
+        }
+      },
+      "ResultWriter": {
+        "Resource": "arn:aws:states:::s3:putObject",
+        "Arguments": {
+          "Bucket": "bucket-resultados-placeholder",
+          "Prefix": "{% 'ingestao-dynamodb/' & $states.context.Execution.Name %}"
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FalhaNoLote"
+        }
+      ],
+      "Next": "LoteConcluido"
+    },
+    "NadaAFazer": {
+      "Type": "Succeed"
+    },
+    "LoteConcluido": {
+      "Type": "Succeed"
+    },
+    "FalhaNaDescoberta": {
+      "Type": "Fail",
+      "Error": "DescobertaFalhou",
+      "Cause": "getTables nao respondeu; nenhuma tabela foi processada"
+    },
+    "FalhaNoLote": {
+      "Comment": "Uma tabela quebrada nao marca o dia inteiro como falho (ToleratedFailureCount); duas indicam problema sistemico e chegam ate aqui.",
+      "Type": "Fail",
+      "Error": "LoteFalhou"
+    }
+  }
+}

@@ -1,0 +1,132 @@
+{
+  "Comment": "Manutencao semanal das tabelas Iceberg. Cada ingestao diaria e um INSERT OVERWRITE e cada overwrite grava uma copia integral dos dados num snapshot novo: sem expiracao o storage cresce linearmente nas 9 tabelas ao mesmo tempo.",
+  "QueryLanguage": "JSONata",
+  "StartAt": "DescobrirTabelas",
+  "TimeoutSeconds": 86400,
+  "States": {
+    "DescobrirTabelas": {
+      "Comment": "Mesmo criterio de descoberta da maquina diaria: quem e ingerido e quem precisa de manutencao sao o mesmo conjunto, por construcao.",
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getTables",
+      "Arguments": {
+        "DatabaseName": "database-placeholder",
+        "Expression": "prefixo-placeholder*"
+      },
+      "Output": {
+        "lote": "{% [$states.result.TableList[Parameters.`ingestao.habilitado` = 'true'].{'tabela_destino': 'catalogo-placeholder.' & DatabaseName & '.' & Name}] %}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.ThrottlingException",
+            "Glue.InternalServiceException",
+            "Glue.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 5,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FalhaNaDescoberta"
+        }
+      ],
+      "Next": "AvaliarLote"
+    },
+    "AvaliarLote": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $count($states.input.lote) = 0 %}",
+          "Next": "NadaAFazer"
+        }
+      ],
+      "Default": "ManterTabelas"
+    },
+    "ManterTabelas": {
+      "Comment": "MaxConcurrency 2: rewrite_data_files reescreve a tabela inteira, entao duas em paralelo ja saturam o orcamento de IO que se quer gastar num fim de semana.",
+      "Type": "Map",
+      "Label": "Manutencao",
+      "Items": "{% $states.input.lote %}",
+      "MaxConcurrency": 2,
+      "ToleratedFailureCount": 2,
+      "ItemSelector": {
+        "tabela_destino": "{% $states.context.Map.Item.Value.tabela_destino %}",
+        "execution_id": "{% $states.context.Execution.Name %}"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "DISTRIBUTED",
+          "ExecutionType": "STANDARD"
+        },
+        "StartAt": "CompactarEExpirar",
+        "States": {
+          "CompactarEExpirar": {
+            "Comment": "retencao_horas curta de proposito: 48h cobrem o rollback de uma ingestao ruim e nada alem disso. O job roda rewrite_data_files, expire_snapshots e remove_orphan_files nessa ordem.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Arguments": {
+              "JobName": "job-manutencao-placeholder",
+              "WorkerType": "G.1X",
+              "NumberOfWorkers": 4,
+              "Arguments": {
+                "--tabela_destino": "{% $states.input.tabela_destino %}",
+                "--retencao_horas": "48",
+                "--execution_id": "{% $states.input.execution_id %}"
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Glue.ConcurrentRunsExceededException"
+                ],
+                "IntervalSeconds": 60,
+                "MaxAttempts": 10,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 900,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "TimeoutSeconds": 21600,
+            "End": true
+          }
+        }
+      },
+      "ResultWriter": {
+        "Resource": "arn:aws:states:::s3:putObject",
+        "Arguments": {
+          "Bucket": "bucket-resultados-placeholder",
+          "Prefix": "{% 'manutencao-iceberg/' & $states.context.Execution.Name %}"
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "FalhaNoLote"
+        }
+      ],
+      "Next": "LoteConcluido"
+    },
+    "NadaAFazer": {
+      "Type": "Succeed"
+    },
+    "LoteConcluido": {
+      "Type": "Succeed"
+    },
+    "FalhaNaDescoberta": {
+      "Type": "Fail",
+      "Error": "DescobertaFalhou"
+    },
+    "FalhaNoLote": {
+      "Type": "Fail",
+      "Error": "ManutencaoFalhou"
+    }
+  }
+}
