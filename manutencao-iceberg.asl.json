@@ -1,0 +1,260 @@
+{
+  "Comment": "Manutencao semanal das tabelas Iceberg. Cada overwrite diario cria um snapshot que referencia uma copia integral dos dados: sem expiracao, o storage das 9 tabelas cresce linearmente para sempre. Mesma descoberta da maquina de ingestao, para nao existir uma segunda fonte de verdade sobre quais tabelas existem.",
+  "QueryLanguage": "JSONata",
+  "StartAt": "DefinirContexto",
+  "TimeoutSeconds": 43200,
+  "States": {
+    "DefinirContexto": {
+      "Comment": "Retencao curta e o ponto do desenho: com full overwrite, cada dia retido e mais uma copia da tabela inteira no S3.",
+      "Type": "Pass",
+      "Assign": {
+        "prefixo": "prefixo-tabelas-placeholder",
+        "banco": "banco-iceberg-placeholder",
+        "catalogo": "catalogo-iceberg-placeholder",
+        "dias_retencao": "3",
+        "snapshots_retidos": "2",
+        "execution_id": "{% $states.context.Execution.Name %}"
+      },
+      "Next": "DescobrirTabelas"
+    },
+
+    "DescobrirTabelas": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:glue:getTables",
+      "Arguments": {
+        "DatabaseName": "{% $banco %}",
+        "Expression": "{% $prefixo & '*' %}"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Glue.EntityNotFoundException"
+          ],
+          "MaxAttempts": 0
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 4,
+          "BackoffRate": 2,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Next": "MontarLote"
+    },
+
+    "MontarLote": {
+      "Comment": "Mesmo filtro da ingestao: manter tabela que ninguem ingere seria pagar compactacao por dado parado.",
+      "Type": "Pass",
+      "Assign": {
+        "lote": "{% [ $states.input.TableList[ $substring(Name, 0, $length($prefixo)) = $prefixo and $lookup(Parameters, 'ingestao.habilitado') = 'true' ].{ 'tabela_destino': $catalogo & '.' & $banco & '.' & Name, 'execution_id': $execution_id, 'dias_retencao': $dias_retencao, 'snapshots_retidos': $snapshots_retidos } ] %}"
+      },
+      "Next": "LoteVazio"
+    },
+
+    "LoteVazio": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $count($lote) = 0 %}",
+          "Next": "NadaAManter"
+        }
+      ],
+      "Default": "ManterTabelas"
+    },
+
+    "ManterTabelas": {
+      "Comment": "MaxConcurrency 2 e menor que o da ingestao de proposito: rewrite_data_files reescreve dados de verdade, e nao vale disputar capacidade do Glue com a janela diaria. ToleratedFailureCount 2 porque manutencao que falha nao corrompe nada - o pior caso e o storage nao encolher nesta semana.",
+      "Type": "Map",
+      "Label": "ManutencaoPorTabela",
+      "Items": "{% $lote %}",
+      "MaxConcurrency": 2,
+      "ToleratedFailureCount": 2,
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "DISTRIBUTED",
+          "ExecutionType": "STANDARD"
+        },
+        "StartAt": "PrepararItem",
+        "States": {
+          "PrepararItem": {
+            "Type": "Pass",
+            "Assign": {
+              "tabela": "{% $states.input %}",
+              "inicio_ms": "{% $millis() %}",
+              "erro": {}
+            },
+            "Next": "CompactarEExpirar"
+          },
+
+          "CompactarEExpirar": {
+            "Comment": "Numero de workers fixo: o custo aqui acompanha o tamanho da tabela, que ja esta na serie de BilledSizeBytes da tabela de observabilidade se algum dia precisar de ajuste.",
+            "Type": "Task",
+            "Resource": "arn:aws:states:::glue:startJobRun.sync",
+            "Arguments": {
+              "JobName": "job-manutencao-placeholder",
+              "WorkerType": "G.1X",
+              "NumberOfWorkers": 4,
+              "Arguments": {
+                "--tabela_destino": "{% $tabela.tabela_destino %}",
+                "--dias_retencao": "{% $tabela.dias_retencao %}",
+                "--snapshots_retidos": "{% $tabela.snapshots_retidos %}",
+                "--execution_id": "{% $tabela.execution_id %}"
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Glue.ConcurrentRunsExceededException"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 10,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 600,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Assign": {
+                  "erro": "{% $states.errorOutput %}"
+                },
+                "Next": "RegistrarFalha"
+              }
+            ],
+            "Next": "RegistrarSucesso"
+          },
+
+          "RegistrarSucesso": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem",
+            "Arguments": {
+              "TableName": "tabela-observabilidade-placeholder",
+              "Item": {
+                "pk": {
+                  "S": "{% 'MANUTENCAO#' & $tabela.tabela_destino %}"
+                },
+                "sk": {
+                  "S": "{% $tabela.execution_id %}"
+                },
+                "status_manutencao": {
+                  "S": "CONCLUIDO"
+                },
+                "dias_retencao": {
+                  "N": "{% $tabela.dias_retencao %}"
+                },
+                "snapshots_retidos": {
+                  "N": "{% $tabela.snapshots_retidos %}"
+                },
+                "duracao_ms": {
+                  "N": "{% $string($millis() - $inicio_ms) %}"
+                }
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "DynamoDb.ProvisionedThroughputExceededException",
+                  "DynamoDb.InternalServerErrorException",
+                  "DynamoDb.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 5,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Output": "{% { 'tabela': $tabela.tabela_destino, 'status': 'CONCLUIDO' } %}",
+            "End": true
+          },
+
+          "RegistrarFalha": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::dynamodb:putItem",
+            "Arguments": {
+              "TableName": "tabela-observabilidade-placeholder",
+              "Item": {
+                "pk": {
+                  "S": "{% 'MANUTENCAO#' & $tabela.tabela_destino %}"
+                },
+                "sk": {
+                  "S": "{% $tabela.execution_id %}"
+                },
+                "status_manutencao": {
+                  "S": "FALHOU"
+                },
+                "duracao_ms": {
+                  "N": "{% $string($millis() - $inicio_ms) %}"
+                },
+                "erro": {
+                  "S": "{% $string($erro) %}"
+                }
+              }
+            },
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "DynamoDb.ProvisionedThroughputExceededException",
+                  "DynamoDb.InternalServerErrorException",
+                  "DynamoDb.SdkClientException"
+                ],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 5,
+                "BackoffRate": 2,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": [
+                  "States.ALL"
+                ],
+                "Next": "Falha"
+              }
+            ],
+            "Next": "Falha"
+          },
+
+          "Falha": {
+            "Type": "Fail",
+            "Error": "ManutencaoFalhou"
+          }
+        }
+      },
+      "ResultWriter": {
+        "Resource": "arn:aws:states:::s3:putObject",
+        "Arguments": {
+          "Bucket": "bucket-resultados-placeholder",
+          "Prefix": "{% 'manutencao-iceberg/' & $execution_id %}"
+        }
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "LoteFalhou"
+        }
+      ],
+      "Next": "Sucesso"
+    },
+
+    "LoteFalhou": {
+      "Type": "Fail",
+      "Error": "LoteDeManutencaoFalhou"
+    },
+
+    "NadaAManter": {
+      "Type": "Succeed"
+    },
+
+    "Sucesso": {
+      "Type": "Succeed"
+    }
+  }
+}
